@@ -14,8 +14,8 @@ venv/
 # jupyter
 .ipynb_checkpoints/
 
-# data
-data/
+# data (raw Kaggle download only, not src/tests data packages)
+/data/
 
 # env / secrets
 .env
