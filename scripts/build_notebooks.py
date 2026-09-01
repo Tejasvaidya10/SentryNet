@@ -157,9 +157,26 @@ def main() -> None:
                 '    risk_encoder = MerchantRiskEncoder(category_col="ProductCD").fit(train_df)\n'
                 "    train_df = train_df.assign(merchant_risk=risk_encoder.transform(train_df))\n"
                 "    test_df = test_df.assign(merchant_risk=risk_encoder.transform(test_df))\n\n"
-                '    feature_cols = ["TransactionAmt", "dist1", "dist2", "velocity_1h", "time_since_last",\n'
-                '                     "addr_changed", "merchant_risk",\n'
-                '                     "device_fingerprint_degree", "card_entity_id_degree"]\n'
+                "    # Vesta's anonymized engineered features (V1-V339) and count/day-delta\n"
+                "    # features (C1-C14, D1-D15) carry most of the raw signal in this dataset;\n"
+                "    # pull them in programmatically rather than hand-listing hundreds of names.\n"
+                '    raw_numeric_cols = (\n'
+                '        [c for c in df.columns if c.startswith("V")]\n'
+                '        + [c for c in df.columns if c.startswith("C") and c[1:].isdigit()]\n'
+                '        + [c for c in df.columns if c.startswith("D") and c[1:].isdigit()]\n'
+                '        + ["card1", "card2", "card3", "card5", "addr1", "addr2"]\n'
+                "    )\n"
+                "    # All four graph stats per entity type, not just degree.\n"
+                '    graph_stat_cols = [\n'
+                '        c for c in df.columns\n'
+                '        if c.startswith("device_fingerprint_") or c.startswith("card_entity_id_")\n'
+                "    ]\n"
+                '    feature_cols = (\n'
+                '        ["TransactionAmt", "dist1", "dist2", "velocity_1h", "time_since_last",\n'
+                '         "addr_changed", "merchant_risk"]\n'
+                "        + graph_stat_cols\n"
+                "        + raw_numeric_cols\n"
+                "    )\n"
                 '    model = train_model(train_df[feature_cols], train_df["isFraud"])',
             ),
             (
