@@ -1,17 +1,21 @@
 """Generate the SentryNet narrative notebook skeletons.
 
 Notebooks import from the sentrynet package rather than embedding logic
-directly, and guard on the presence of the real Kaggle CSVs (gitignored
-under data/) so they execute cleanly end-to-end even before the dataset is
-downloaded. Re-run this script to reset notebooks back to their skeleton
-state.
+directly. Each notebook runs in its own kernel, so state is never shared
+between notebook files in memory -- instead, each notebook loads its own
+required inputs (raw CSVs or a previous notebook's parquet output) and,
+where a later notebook depends on it, writes its output to data/ as
+parquet. Each notebook guards on its own required input(s) so it fails
+with a clear "run <previous notebook> first" message rather than a
+NameError if run out of order. Re-run this script to reset notebooks back
+to their skeleton state.
 """
 
 from pathlib import Path
 
 import nbformat as nbf
 
-GUARD_CODE = (
+RAW_DATA_GUARD = (
     "from sentrynet.config import DATA_DIR\n\n"
     'TRANSACTION_PATH = DATA_DIR / "train_transaction.csv"\n'
     'IDENTITY_PATH = DATA_DIR / "train_identity.csv"\n'
@@ -21,10 +25,27 @@ GUARD_CODE = (
     '          "Fraud Detection dataset from Kaggle and place it under data/ to run this notebook.")'
 )
 
+FEATURES_GUARD = (
+    "from sentrynet.config import DATA_DIR\n\n"
+    'FEATURES_PATH = DATA_DIR / "features.parquet"\n'
+    "DATA_AVAILABLE = FEATURES_PATH.exists()\n\n"
+    "if not DATA_AVAILABLE:\n"
+    '    print(f"{FEATURES_PATH} not found. Run 02_feature_engineering.ipynb first.")'
+)
 
-def build_notebook(title: str, sections: list[tuple[str, str]]) -> nbf.NotebookNode:
+SPLIT_GUARD = (
+    "from sentrynet.config import DATA_DIR\n\n"
+    'TRAIN_SPLIT_PATH = DATA_DIR / "train_split.parquet"\n'
+    'TEST_SPLIT_PATH = DATA_DIR / "test_split.parquet"\n'
+    "DATA_AVAILABLE = TRAIN_SPLIT_PATH.exists() and TEST_SPLIT_PATH.exists()\n\n"
+    "if not DATA_AVAILABLE:\n"
+    '    print(f"{TRAIN_SPLIT_PATH} / {TEST_SPLIT_PATH} not found. Run 03_modeling_evaluation.ipynb first.")'
+)
+
+
+def build_notebook(title: str, guard_code: str, sections: list[tuple[str, str]]) -> nbf.NotebookNode:
     nb = nbf.v4.new_notebook()
-    cells = [nbf.v4.new_markdown_cell(f"# {title}"), nbf.v4.new_code_cell(GUARD_CODE)]
+    cells = [nbf.v4.new_markdown_cell(f"# {title}"), nbf.v4.new_code_cell(guard_code)]
     for heading, code in sections:
         cells.append(nbf.v4.new_markdown_cell(f"## {heading}"))
         cells.append(nbf.v4.new_code_cell(code))
@@ -38,6 +59,7 @@ def main() -> None:
 
     eda = build_notebook(
         "SentryNet -- Exploratory Data Analysis",
+        RAW_DATA_GUARD,
         [
             (
                 "Load data",
@@ -57,7 +79,15 @@ def main() -> None:
 
     feature_engineering = build_notebook(
         "SentryNet -- Feature Engineering (including graph features)",
+        RAW_DATA_GUARD,
         [
+            (
+                "Load data",
+                "if DATA_AVAILABLE:\n"
+                "    import pandas as pd\n\n"
+                "    from sentrynet.data.loader import load_transactions\n\n"
+                "    df = load_transactions(TRANSACTION_PATH, IDENTITY_PATH)",
+            ),
             (
                 "Transaction-level features (label-independent, safe to compute before the split)",
                 "if DATA_AVAILABLE:\n"
@@ -79,11 +109,14 @@ def main() -> None:
                 "# probabilistic heuristic, not a verified cardholder ID -- see\n"
                 "# sentrynet.graph.fingerprint.build_card_entity_ids docstring.\n"
                 "if DATA_AVAILABLE:\n"
-                "    from sentrynet.graph.fingerprint import build_device_fingerprints\n"
+                "    from sentrynet.graph.fingerprint import build_device_fingerprints, cap_high_frequency_entities\n"
                 "    from sentrynet.graph.build import build_bipartite_graph\n"
                 "    from sentrynet.graph.features import extract_entity_features\n"
                 "    from sentrynet.graph.join import transaction_entity_features\n\n"
-                '    df["device_fingerprint"] = build_device_fingerprints(df)\n'
+                "    # Cap generic, high-frequency device signatures (e.g. common Windows+Chrome\n"
+                "    # combos) -- otherwise they'd form supernodes that make graph projection\n"
+                "    # intractable, and they aren't a genuine shared-identity signal anyway.\n"
+                '    df["device_fingerprint"] = cap_high_frequency_entities(build_device_fingerprints(df))\n'
                 "    g = build_bipartite_graph(\n"
                 '        df, transaction_id_col="TransactionID",\n'
                 '        entity_cols=("device_fingerprint", "card_entity_id"),\n'
@@ -94,12 +127,26 @@ def main() -> None:
                 "    )\n"
                 "    df = pd.concat([df, graph_features], axis=1)",
             ),
+            (
+                "Save engineered features for the next notebook",
+                "if DATA_AVAILABLE:\n"
+                '    features_path = DATA_DIR / "features.parquet"\n'
+                "    df.to_parquet(features_path)\n"
+                '    print(f"Wrote {features_path} with shape {df.shape}")',
+            ),
         ],
     )
 
     modeling_evaluation = build_notebook(
         "SentryNet -- Modeling and Evaluation",
+        FEATURES_GUARD,
         [
+            (
+                "Load engineered features",
+                "if DATA_AVAILABLE:\n"
+                "    import pandas as pd\n\n"
+                "    df = pd.read_parquet(FEATURES_PATH)",
+            ),
             (
                 "Temporal train/test split, merchant risk encoding (train-only fit), and training",
                 "if DATA_AVAILABLE:\n"
@@ -121,12 +168,22 @@ def main() -> None:
                 "    from imblearn.over_sampling import SMOTE\n"
                 "    from sentrynet.modeling.evaluate import pr_auc\n"
                 "    import xgboost as xgb\n\n"
+                "    # SMOTE requires complete data, unlike XGBoost which handles NaN natively --\n"
+                "    # dist1/dist2 (sparse in the raw data), time_since_last (NaN for each\n"
+                "    # entity's first transaction), and the graph-degree features (NaN when a\n"
+                "    # transaction has no identity/device signal) all legitimately contain NaN.\n"
+                "    # This extra imputation step is itself one practical argument for\n"
+                "    # scale_pos_weight over SMOTE.\n"
+                '    X_train_imputed = train_df[feature_cols].fillna(-999)\n'
                 "    X_resampled, y_resampled = SMOTE(random_state=42).fit_resample(\n"
-                '        train_df[feature_cols], train_df["isFraud"]\n'
+                '        X_train_imputed, train_df["isFraud"]\n'
                 "    )\n"
                 '    smote_model = xgb.XGBClassifier(eval_metric="aucpr", random_state=42)\n'
                 "    smote_model.fit(X_resampled, y_resampled)\n"
-                "    smote_scores = smote_model.predict_proba(test_df[feature_cols])[:, 1]\n"
+                "    # Score with the same -999 imputation smote_model was trained on, rather\n"
+                "    # than raw NaN, so missing values route through its trees consistently.\n"
+                "    X_test_imputed = test_df[feature_cols].fillna(-999)\n"
+                "    smote_scores = smote_model.predict_proba(X_test_imputed)[:, 1]\n"
                 '    print("PR-AUC (SMOTE):", pr_auc(test_df["isFraud"], smote_scores))\n'
                 '    print("PR-AUC (scale_pos_weight):", pr_auc(test_df["isFraud"], model.predict_proba(test_df[feature_cols])[:, 1]))',
             ),
@@ -141,12 +198,26 @@ def main() -> None:
                 "    )\n"
                 '    print("Best threshold:", best_threshold, "cost:", best_cost)',
             ),
+            (
+                "Save train/test splits for the drift-detection notebook",
+                "if DATA_AVAILABLE:\n"
+                '    train_df.to_parquet(DATA_DIR / "train_split.parquet")\n'
+                '    test_df.to_parquet(DATA_DIR / "test_split.parquet")',
+            ),
         ],
     )
 
     drift_detection = build_notebook(
         "SentryNet -- Concept Drift Detection",
+        SPLIT_GUARD,
         [
+            (
+                "Load train/test splits",
+                "if DATA_AVAILABLE:\n"
+                "    import pandas as pd\n\n"
+                "    train_df = pd.read_parquet(TRAIN_SPLIT_PATH)\n"
+                "    test_df = pd.read_parquet(TEST_SPLIT_PATH)",
+            ),
             (
                 "Real drift across the temporal split",
                 "if DATA_AVAILABLE:\n"
